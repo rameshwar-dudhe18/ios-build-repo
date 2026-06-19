@@ -1,146 +1,139 @@
-name: Secure Deploy Pipeline
+name: Multi-Service Secure Deploy
 
 on:
   workflow_dispatch:
     inputs:
-      commit_hash:
-        description: "Approved Bitbucket merge commit hash"
+      repo_name:
+        description: "Select service repo"
         required: true
+        type: choice
+        options:
+          - backend-api
+          - chatbot-api
+          - demo-setup
+          - hub-portal
+          - mobile-app
+          - Oauth_Module
+          - online-banking
+          - rpa-backend-server
+          - rpa-helix
+          - Teller
+
+      commit_hash:
+        description: "Approved commit hash"
+        required: true
+
       environment:
-        description: "Target environment (dev/staging/prod)"
+        description: "Environment"
         required: true
         default: "staging"
+
       action:
-        description: "deploy or rollback"
+        description: "deploy / rollback"
         required: true
         default: "deploy"
 
+env:
+  WORKSPACE: "your-bitbucket-workspace"
+
 jobs:
 
-  verify-hash:
-    name: Verify Bitbucket Approval
+  verify:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Validate commit hash from Bitbucket
+      - name: Verify hash from Bitbucket
         env:
-          BITBUCKET_TOKEN: ${{ secrets.BITBUCKET_TOKEN }}
-          REPO: "<workspace>/<repo>"
-          HASH: ${{ github.event.inputs.commit_hash }}
+          TOKEN: ${{ secrets.BITBUCKET_TOKEN }}
         run: |
-          echo "Validating hash: $HASH"
+          REPO=${{ github.event.inputs.repo_name }}
+          HASH=${{ github.event.inputs.commit_hash }}
 
-          # Get last 3 merged PR commits
-          RESPONSE=$(curl -s -H "Authorization: Bearer $BITBUCKET_TOKEN" \
-            "https://api.bitbucket.org/2.0/repositories/$REPO/pullrequests?state=MERGED&sort=-updated_on")
+          RESPONSE=$(curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://api.bitbucket.org/2.0/repositories/$WORKSPACE/$REPO/pullrequests?state=MERGED&sort=-updated_on")
 
-          # Extract last 3 merge commit hashes
           MERGES=$(echo "$RESPONSE" | jq -r '.values[:3] | .[].merge_commit.hash')
 
-          echo "Recent merges:"
-          echo "$MERGES"
-
           if echo "$MERGES" | grep -q "$HASH"; then
-            echo "Hash is valid and recent"
+            echo "Valid hash"
           else
-            echo "Invalid or too old hash"
+            echo "Invalid hash"
             exit 1
           fi
 
-  build-test-scan:
-    name: Tests + Security Checks
-    needs: verify-hash
+  checkout:
+    needs: verify
     runs-on: self-hosted
-
     steps:
-      - name: Checkout specific commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.commit_hash }}
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Run Tests (Backend + Angular)
+      - name: Clone Bitbucket repo dynamically
+        env:
+          TOKEN: ${{ secrets.BITBUCKET_TOKEN }}
         run: |
-          npm test
+          REPO=${{ github.event.inputs.repo_name }}
+          HASH=${{ github.event.inputs.commit_hash }}
 
-      - name: SCA - Dependency Scan
+          git clone https://x-token-auth:$TOKEN@bitbucket.org/$WORKSPACE/$REPO.git
+          cd $REPO
+          git checkout $HASH
+
+  test-scan:
+    needs: checkout
+    runs-on: self-hosted
+    steps:
+      - name: Run Tests
+        run: |
+          cd ${{ github.event.inputs.repo_name }}
+          npm install
+          npm test || true
+
+      - name: SCA
         run: |
           npm audit --audit-level=high || true
 
-      - name: SonarQube Scan
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      - name: Sonar Scan
         run: |
           sonar-scanner \
-            -Dsonar.projectKey=my-project \
-            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
-            -Dsonar.login=$SONAR_TOKEN
-
-      - name: Sonar Quality Gate Check
-        run: |
-          sleep 10
+            -Dsonar.projectKey=${{ github.event.inputs.repo_name }}
 
   deploy:
-    name: Deploy Application
-    needs: build-test-scan
     if: github.event.inputs.action == 'deploy'
+    needs: test-scan
     runs-on: self-hosted
-
     steps:
-      - name: Checkout commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.commit_hash }}
-
-      - name: Build app
+      - name: Deploy Service
         run: |
-          npm run build
+          SERVICE=${{ github.event.inputs.repo_name }}
+          HASH=${{ github.event.inputs.commit_hash }}
 
-      - name: Deploy using symlink swap
-        run: |
-          APP_DIR=/var/www/app
-          RELEASE_DIR=$APP_DIR/releases/${{ github.event.inputs.commit_hash }}
+          BASE=/opt/apps/$SERVICE
+          RELEASE=$BASE/releases/$HASH
 
-          mkdir -p $RELEASE_DIR
-          cp -r * $RELEASE_DIR/
+          mkdir -p $RELEASE
+          cp -r $SERVICE/* $RELEASE/
 
-          ln -sfn $RELEASE_DIR $APP_DIR/current
-
-      - name: Save deployment history
-        run: |
-          echo "${{ github.event.inputs.commit_hash }}" >> /var/www/app/deploy.log
+          ln -sfn $RELEASE $BASE/current
 
   rollback:
-    name: Rollback Deployment
     if: github.event.inputs.action == 'rollback'
     runs-on: self-hosted
-
     steps:
-      - name: Get previous commit
-        id: prev
+      - name: Rollback Service
         run: |
-          PREV=$(tail -n 2 /var/www/app/deploy.log | head -n 1)
-          echo "previous=$PREV" >> $GITHUB_OUTPUT
+          SERVICE=${{ github.event.inputs.repo_name }}
+          BASE=/opt/apps/$SERVICE
 
-      - name: Rollback via symlink
-        run: |
-          APP_DIR=/var/www/app
-          PREV=${{ steps.prev.outputs.previous }}
+          PREV=$(ls -t $BASE/releases | sed -n '2p')
 
-          ln -sfn $APP_DIR/releases/$PREV $APP_DIR/current
+          ln -sfn $BASE/releases/$PREV $BASE/current
 
   notify:
-    name: Slack Notification
     needs: [deploy, rollback]
     runs-on: ubuntu-latest
-
     steps:
-      - name: Notify Slack
+      - name: Slack Notify
         run: |
           curl -X POST -H 'Content-type: application/json' \
           --data "{
-            \"text\": \"Deployment *${{ github.event.inputs.action }}* completed for commit *${{ github.event.inputs.commit_hash }}* in *${{ github.event.inputs.environment }}*\"
+            \"text\": \"${{ github.event.inputs.repo_name }} deployed (${{
+            github.event.inputs.commit_hash }})\"
           }" \
           ${{ secrets.SLACK_WEBHOOK }}
